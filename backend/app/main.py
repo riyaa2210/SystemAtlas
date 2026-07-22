@@ -24,17 +24,14 @@ async def lifespan(app: FastAPI):
     # Ensure temp directory exists
     os.makedirs(settings.temp_dir, exist_ok=True)
 
-    # Create PostgreSQL tables (in dev; use Alembic in prod)
-    if settings.is_development:
-        try:
-            await create_db_tables()
-        except Exception as e:
-            logger.warning(
-                "Database not available at startup — "
-                "update DATABASE_URL in .env with your Supabase connection string. "
-                "API endpoints requiring DB will return 500 until connected.",
-                error=str(e),
-            )
+    # Create PostgreSQL tables on every startup (idempotent — CREATE TABLE IF NOT EXISTS)
+    try:
+        await create_db_tables()
+    except Exception as e:
+        logger.warning(
+            "Database not available at startup",
+            error=str(e),
+        )
 
     logger.info("Application startup complete")
     yield
@@ -47,8 +44,8 @@ def create_app() -> FastAPI:
         title=settings.app_name,
         version=settings.app_version,
         description="AI-powered software architecture visualization and code intelligence platform.",
-        docs_url="/docs" if settings.is_development else None,
-        redoc_url="/redoc" if settings.is_development else None,
+        docs_url="/docs",
+        redoc_url="/redoc",
         lifespan=lifespan,
     )
 
