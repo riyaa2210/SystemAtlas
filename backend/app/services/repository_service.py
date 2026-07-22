@@ -1,45 +1,156 @@
 """
-Repository service — orchestrates the full scan pipeline.
-Triggered via FastAPI BackgroundTasks so it never blocks the API response.
-
-Pipeline stages:
-  1. clone        — shallow git clone to temp dir
-  2. analyzing    — language detection + manifest parsing
-  3. building_graph — static code analysis + Neo4j graph construction
-  4. scoring      — risk detection + architecture metrics
-  5. done         — cleanup, status update
+Repository service — scan pipeline using GitHub API (no git clone).
+Graph is stored in PostgreSQL (JSONB) so it always works without Neo4j.
+Neo4j is used additionally if available for richer graph queries.
 """
 import uuid
+import json as _json
+import os as _os
+import re as _re
+import tempfile
+import shutil
+import hashlib
+from collections import Counter
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path as _Path, PurePosixPath
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.repositories.repo_repository import RepoRepository
-from app.core.scanner.github_client import GitHubClient
-from app.core.scanner.repo_cloner import RepoCloner
-from app.core.scanner.language_detector import LanguageDetector
+from app.core.scanner.github_client import GitHubClient, GitHubFile
 from app.core.scanner.manifest_parser import ManifestParser
 from app.core.analyzer.python_analyzer import PythonAnalyzer
 from app.core.analyzer.js_analyzer import JsAnalyzer
 from app.core.analyzer.java_analyzer import JavaAnalyzer
 from app.core.analyzer.analysis_result import FileAnalysisResult
 from app.core.graph.graph_builder import GraphBuilder
-from app.core.graph.risk_detector import RiskDetector
+from app.core.graph.risk_detector import RiskDetector, RiskReport
 from app.core.analytics.metrics_engine import MetricsEngine
 from app.utils.logger import get_logger
 from app.utils.exceptions import NotFoundError, UnauthorizedError
 
 logger = get_logger(__name__)
 
-# Directories to skip during file analysis walk
-SKIP_DIRS = {
-    ".git", "node_modules", "__pycache__", ".venv", "venv", "env",
-    "dist", "build", ".next", "target", "coverage",
+_SCAN_TMP = _os.path.join(
+    _os.environ.get("TEMP", _os.environ.get("TMP", "/tmp")), "lam_scan"
+)
+
+_EXT_MAP = {
+    "Python": ".py",
+    "TypeScript": ".ts",
+    "JavaScript": ".js",
+    "Java": ".java",
 }
 
-# Safety cap — prevents runaway scans on enormous repos
-MAX_FILES = 500
+
+def _make_id(*parts: str) -> str:
+    raw = "|".join(str(p) for p in parts)
+    return hashlib.sha1(raw.encode()).hexdigest()[:16]
+
+
+def _build_in_memory_graph(
+    repo_id: str,
+    repo_name: str,
+    results: list[FileAnalysisResult],
+) -> tuple[list[dict], list[dict]]:
+    """
+    Build graph nodes and edges from analysis results in memory.
+    Stored in PostgreSQL JSONB — works without Neo4j.
+    """
+    nodes: list[dict] = []
+    edges: list[dict] = []
+    file_id_map: dict[str, str] = {}
+
+    # Repository node
+    repo_node_id = _make_id("repository", repo_id)
+    nodes.append({
+        "id": repo_node_id, "type": "Service",
+        "label": repo_name,
+        "properties": {"name": repo_name, "repo_id": repo_id},
+    })
+
+    # Module grouping
+    module_map: dict[str, list] = {}
+    for r in results:
+        top = str(PurePosixPath(r.file_path.replace("\\", "/")).parts[0]) if "/" in r.file_path else "."
+        module_map.setdefault(top, []).append(r)
+
+    module_id_map: dict[str, str] = {}
+    for module_path, files in module_map.items():
+        mid = _make_id("module", repo_id, module_path)
+        module_id_map[module_path] = mid
+        nodes.append({
+            "id": mid, "type": "Module",
+            "label": module_path,
+            "properties": {"name": module_path, "path": module_path, "repo_id": repo_id, "file_count": len(files)},
+        })
+        edges.append({"id": f"{repo_node_id}->{mid}", "source": repo_node_id, "target": mid, "type": "CONTAINS", "properties": {}})
+
+    for result in results:
+        norm = result.file_path.replace("\\", "/")
+        fid = _make_id("file", repo_id, norm)
+        file_id_map[norm] = fid
+        top = str(PurePosixPath(norm).parts[0]) if "/" in norm else "."
+        fname = PurePosixPath(norm).name
+
+        nodes.append({
+            "id": fid, "type": "File",
+            "label": fname,
+            "properties": {
+                "name": fname, "path": norm, "repo_id": repo_id,
+                "language": result.language, "lines_of_code": result.lines_of_code,
+                "has_documentation": result.has_documentation,
+                "functions": len(result.functions),
+                "classes": len(result.classes),
+            },
+        })
+
+        mid = module_id_map.get(top)
+        if mid:
+            edges.append({"id": f"{mid}->{fid}", "source": mid, "target": fid, "type": "CONTAINS", "properties": {}})
+
+        # API endpoints
+        for ep in result.api_endpoints:
+            aid = _make_id("api", repo_id, norm, ep.path, ep.method)
+            nodes.append({
+                "id": aid, "type": "Api",
+                "label": f"{ep.method} {ep.path}",
+                "properties": {"name": ep.handler, "path": ep.path, "method": ep.method, "repo_id": repo_id},
+            })
+            edges.append({"id": f"{fid}->{aid}", "source": fid, "target": aid, "type": "DEFINES", "properties": {}})
+
+    # Import edges
+    for result in results:
+        norm = result.file_path.replace("\\", "/")
+        src_id = file_id_map.get(norm)
+        if not src_id:
+            continue
+        src_dir = str(PurePosixPath(norm).parent)
+        for imp in result.imports:
+            # Try to resolve to known file
+            for candidate in _resolve_candidates(imp.module, imp.is_relative, src_dir, result.language):
+                tgt_id = file_id_map.get(candidate)
+                if tgt_id and tgt_id != src_id:
+                    eid = f"{src_id}->{tgt_id}"
+                    edges.append({"id": eid, "source": src_id, "target": tgt_id, "type": "IMPORTS", "properties": {}})
+                    break
+
+    return nodes, edges
+
+
+def _resolve_candidates(module: str, is_relative: bool, source_dir: str, language: str) -> list[str]:
+    m = module.replace("\\", "/").lstrip("/")
+    if language == "Python":
+        base = f"{source_dir}/{m.replace('.', '/')}" if is_relative else m.replace(".", "/")
+        return [f"{base}.py", f"{base}/__init__.py"]
+    elif language in ("JavaScript", "TypeScript"):
+        base = f"{source_dir}/{m}" if is_relative else m
+        base = str(PurePosixPath(base))
+        return [f"{base}{ext}" for ext in (".ts", ".tsx", ".js", ".jsx")] + [f"{base}/index.ts", f"{base}/index.js"]
+    elif language == "Java":
+        base = m.replace(".", "/")
+        return [f"{base}.java", f"src/main/java/{base}.java"]
+    return []
 
 
 class RepositoryService:
@@ -48,10 +159,6 @@ class RepositoryService:
         self.db = db
 
     async def add_repository(self, user_id: uuid.UUID, github_url: str):
-        """
-        Validate the GitHub URL, fetch metadata from the API, persist to PostgreSQL.
-        Does NOT trigger a scan — that is a separate explicit action.
-        """
         client = GitHubClient()
         owner, repo_name = GitHubClient.parse_github_url(github_url)
         info = await client.get_repo_info(owner, repo_name)
@@ -72,22 +179,17 @@ class RepositoryService:
         return repo
 
     async def trigger_scan(self, repo_id: uuid.UUID, user_id: uuid.UUID):
-        """Create a scan job record. The pipeline runs as a background task."""
+        """Create a new scan job. Previous scan results are preserved until new scan completes."""
         repo = await self.repo_repo.get_by_id(repo_id)
         if not repo:
             raise NotFoundError("Repository", str(repo_id))
         if repo.user_id != user_id:
             raise UnauthorizedError("You do not have access to this repository")
-
         job = await self.repo_repo.create_scan_job(repository_id=repo_id)
-        logger.info("Scan job created", job_id=str(job.id), repo_id=str(repo_id))
+        logger.info("Scan job created", job_id=str(job.id))
         return job
 
     async def run_scan_pipeline(self, job_id: uuid.UUID, repo_id: uuid.UUID) -> None:
-        """
-        Full async scan pipeline — runs as a FastAPI BackgroundTask.
-        Opens its own DB session since the request session has already closed.
-        """
         from app.db.postgres import AsyncSessionFactory
 
         async with AsyncSessionFactory() as db:
@@ -96,128 +198,144 @@ class RepositoryService:
             repo = await repo_repo.get_by_id(repo_id)
 
             if not job or not repo:
-                logger.error("Scan aborted: job or repo not found", job_id=str(job_id))
+                logger.error("Scan aborted: not found", job_id=str(job_id))
                 return
 
-            cloner = RepoCloner(str(job_id))
+            client = GitHubClient()
 
             try:
-                # ── Stage 1: Clone ─────────────────────────────────────────────
-                await repo_repo.update_scan_job(
-                    job,
-                    status="running",
-                    stage="cloning",
-                    started_at=datetime.now(timezone.utc),
-                )
+                # 1. Fetch file tree
+                await repo_repo.update_scan_job(job, status="running", stage="fetching_tree", started_at=datetime.now(timezone.utc))
                 await db.commit()
 
-                clone_path = await cloner.clone(repo.github_url, repo.default_branch)
+                owner, repo_name = GitHubClient.parse_github_url(repo.github_url)
 
-                # ── Stage 2: Detect languages + parse manifests ────────────────
+                rate = await client.check_rate_limit()
+                if rate.get("remaining", 60) < 10:
+                    raise Exception(f"GitHub rate limit: {rate.get('remaining')}/{rate.get('limit')} remaining. Add GITHUB_TOKEN to .env.")
+
+                file_tree = await client.get_file_tree(owner, repo_name, repo.default_branch)
+                if not file_tree and repo.default_branch == "main":
+                    file_tree = await client.get_file_tree(owner, repo_name, "master")
+
+                # 2. Download files
+                await repo_repo.update_scan_job(job, stage="downloading")
+                await db.commit()
+
+                files_fetched: list[GitHubFile] = await client.fetch_files(owner, repo_name, file_tree)
+                await repo_repo.update_scan_job(job, files_scanned=len(files_fetched))
+                await db.commit()
+
+                # 3. Language detection + manifest parsing
                 await repo_repo.update_scan_job(job, stage="analyzing")
                 await db.commit()
 
-                detection = LanguageDetector().detect(clone_path)
-                manifest = ManifestParser().parse(clone_path)
+                lang_counts: Counter = Counter()
+                has_tests = False
+                readme_content = ""
+                manifest_deps: list[str] = []
 
-                # Merge GitHub API languages with locally detected ones (deduplicated)
-                merged_languages = list(dict.fromkeys(
-                    detection.languages + (repo.languages or [])
-                ))
+                for f in files_fetched:
+                    lang_counts[f.language] += 1
+                    if "test" in f.path.lower():
+                        has_tests = True
+                    fname = f.path.split("/")[-1].lower()
+                    if fname == "package.json":
+                        try:
+                            data = _json.loads(f.content)
+                            manifest_deps.extend(data.get("dependencies", {}).keys())
+                            manifest_deps.extend(data.get("devDependencies", {}).keys())
+                        except Exception:
+                            pass
+                    elif fname == "requirements.txt":
+                        for line in f.content.splitlines():
+                            line = line.strip()
+                            if line and not line.startswith("#"):
+                                pkg = _re.split(r"[>=<!~;\[]", line)[0].strip().lower()
+                                if pkg:
+                                    manifest_deps.append(pkg)
+                    elif fname in ("readme.md", "readme.rst", "readme.txt"):
+                        readme_content = f.content[:3000]
 
-                await repo_repo.update_repository(
-                    repo,
-                    languages=merged_languages,
-                    frameworks=manifest.frameworks,
-                )
+                detected_langs = [l for l, _ in lang_counts.most_common() if l != "Unknown"]
+                manifest_frameworks = ManifestParser()._detect_frameworks(manifest_deps)
+                merged_languages = list(dict.fromkeys(detected_langs + (repo.languages or [])))
+
+                await repo_repo.update_repository(repo, languages=merged_languages, frameworks=manifest_frameworks)
                 await db.commit()
 
-                logger.info(
-                    "Analysis complete",
-                    job_id=str(job_id),
-                    languages=merged_languages,
-                    frameworks=manifest.frameworks,
-                    total_files=detection.total_files,
-                )
-
-                # ── Stage 3: Analyze files ─────────────────────────────────────
-                analyzers = [PythonAnalyzer(), JsAnalyzer(), JavaAnalyzer()]
+                # 4. Analyze file contents
+                analyzers = {"Python": PythonAnalyzer(), "TypeScript": JsAnalyzer(), "JavaScript": JsAnalyzer(), "Java": JavaAnalyzer()}
                 results: list[FileAnalysisResult] = []
+                _os.makedirs(_SCAN_TMP, exist_ok=True)
 
-                for file_path in clone_path.rglob("*"):
-                    if any(skip in file_path.parts for skip in SKIP_DIRS):
+                for gh_file in files_fetched:
+                    analyzer = analyzers.get(gh_file.language)
+                    if not analyzer:
                         continue
-                    if not file_path.is_file():
-                        continue
-                    if len(results) >= MAX_FILES:
-                        logger.warning(
-                            "File cap reached, stopping analysis",
-                            cap=MAX_FILES,
-                            job_id=str(job_id),
-                        )
-                        break
+                    try:
+                        ext = _EXT_MAP.get(gh_file.language, ".txt")
+                        with tempfile.NamedTemporaryFile(mode="w", suffix=ext, encoding="utf-8", delete=False, dir=_SCAN_TMP) as tmp:
+                            tmp.write(gh_file.content)
+                            tmp_path = _Path(tmp.name)
+                        result = analyzer.analyze_file(tmp_path, tmp_path.parent)
+                        result.file_path = gh_file.path
+                        result.language = gh_file.language
+                        results.append(result)
+                        try:
+                            _os.unlink(tmp_path)
+                        except Exception:
+                            pass
+                    except Exception as e:
+                        logger.warning("Analysis failed", path=gh_file.path, error=str(e))
 
-                    for analyzer in analyzers:
-                        if analyzer.can_analyze(file_path):
-                            result = analyzer.analyze_file(file_path, clone_path)
-                            results.append(result)
-                            break
-
-                await repo_repo.update_scan_job(job, files_scanned=len(results))
-                await db.commit()
-
-                # ── Stage 4: Build Neo4j graph ────────────────────────────────
+                # 5. Build graph in memory (always works) + Neo4j if available
                 await repo_repo.update_scan_job(job, stage="building_graph")
                 await db.commit()
 
+                graph_nodes, graph_edges = _build_in_memory_graph(str(repo_id), repo.full_name, results)
+                nodes = len(graph_nodes)
+                edges = len(graph_edges)
+
+                # Try Neo4j as well
                 try:
                     from app.db.neo4j import get_neo4j_driver
                     driver = await get_neo4j_driver()
                     async with driver.session(database="neo4j") as neo4j_session:
-                        builder = GraphBuilder()
-                        nodes, edges = await builder.build(
-                            str(repo_id), repo.full_name, results, neo4j_session
-                        )
+                        await GraphBuilder().build(str(repo_id), repo.full_name, results, neo4j_session)
+                    logger.info("Graph also written to Neo4j")
                 except Exception as e:
-                    logger.warning(
-                        "Neo4j graph build failed — continuing without graph",
-                        error=str(e),
-                        job_id=str(job_id),
-                    )
-                    nodes, edges = 0, 0
+                    logger.info("Neo4j not available — using PostgreSQL graph only", reason=str(e)[:80])
 
-                await repo_repo.update_scan_job(
-                    job, nodes_created=nodes, edges_created=edges
-                )
+                await repo_repo.update_scan_job(job, nodes_created=nodes, edges_created=edges)
                 await db.commit()
 
-                # ── Stage 5: Compute metrics ──────────────────────────────────
+                # 6. Score
                 await repo_repo.update_scan_job(job, stage="scoring")
                 await db.commit()
 
-                from app.core.graph.risk_detector import RiskDetector
-                from app.core.analytics.metrics_engine import MetricsEngine
-                from app.core.graph.risk_detector import RiskReport
-
-                risk_report = RiskReport()  # defaults to empty (Phase 8 fills this)
+                risk_report = RiskReport()
                 try:
                     from app.db.neo4j import get_neo4j_driver
                     driver = await get_neo4j_driver()
                     async with driver.session(database="neo4j") as neo4j_session:
                         risk_report = await RiskDetector().detect(str(repo_id), neo4j_session)
                 except Exception:
-                    pass  # non-fatal
+                    pass
 
                 missing_docs = sum(1 for r in results if not r.has_documentation)
-
                 metrics = MetricsEngine().compute(
                     risk_report=risk_report,
-                    total_files=len(results),
-                    total_modules=max(nodes, len(results)),
+                    total_files=len(files_fetched),
+                    total_modules=max(nodes, max(len(results), 1)),
                     total_deps=edges,
                     missing_docs=missing_docs,
-                    has_tests=detection.has_tests,
+                    has_tests=has_tests,
                 )
+
+                metrics.metrics_json["readme_preview"] = readme_content
+                metrics.metrics_json["manifest_deps_count"] = len(manifest_deps)
+                metrics.metrics_json["detected_frameworks"] = manifest_frameworks
 
                 await repo_repo.create_snapshot(
                     repository_id=repo_id,
@@ -231,40 +349,24 @@ class RepositoryService:
                     highly_coupled=metrics.highly_coupled,
                     missing_docs=metrics.missing_docs,
                     metrics_json=metrics.metrics_json,
+                    # Persist graph in Postgres
+                    graph_data={"nodes": graph_nodes, "edges": graph_edges},
                 )
 
-                # ── Done ──────────────────────────────────────────────────────
-                await repo_repo.update_scan_job(
-                    job,
-                    status="completed",
-                    stage="done",
-                    completed_at=datetime.now(timezone.utc),
-                )
+                await repo_repo.update_scan_job(job, status="completed", stage="done", completed_at=datetime.now(timezone.utc))
                 await db.commit()
 
-                logger.info(
-                    "Scan pipeline completed",
-                    job_id=str(job_id),
-                    files=len(results),
-                    score=metrics.architecture_score,
-                )
+                logger.info("Scan complete", job_id=str(job_id), files=len(results), score=metrics.architecture_score, nodes=nodes, edges=edges)
 
             except Exception as e:
-                logger.error(
-                    "Scan pipeline failed",
-                    job_id=str(job_id),
-                    error=str(e),
-                    exc_info=True,
-                )
+                logger.error("Scan failed", job_id=str(job_id), error=str(e), exc_info=True)
                 try:
-                    await repo_repo.update_scan_job(
-                        job,
-                        status="failed",
-                        error_message=str(e)[:500],
-                        completed_at=datetime.now(timezone.utc),
-                    )
+                    await repo_repo.update_scan_job(job, status="failed", error_message=str(e)[:500], completed_at=datetime.now(timezone.utc))
                     await db.commit()
                 except Exception:
                     pass
             finally:
-                cloner.cleanup()
+                try:
+                    shutil.rmtree(_SCAN_TMP, ignore_errors=True)
+                except Exception:
+                    pass

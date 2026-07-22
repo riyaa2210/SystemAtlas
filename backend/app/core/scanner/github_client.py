@@ -1,10 +1,12 @@
 """
 GitHub REST API v3 wrapper.
-Handles repo metadata, language detection, and URL parsing.
-Uses httpx for async HTTP. Falls back gracefully on rate limit errors.
+Fetches repo metadata AND file contents directly via the API.
+NO git clone needed — faster, works everywhere, no git binary required.
 """
-from dataclasses import dataclass
-from typing import Optional
+import base64
+import asyncio
+from dataclasses import dataclass, field
+from typing import Optional, Callable
 
 import httpx
 
@@ -16,6 +18,20 @@ logger = get_logger(__name__)
 settings = get_settings()
 
 GITHUB_API_BASE = "https://api.github.com"
+
+ANALYZABLE_EXTENSIONS = {
+    ".py", ".js", ".ts", ".tsx", ".jsx",
+    ".java", ".go", ".rb", ".rs", ".cs",
+}
+
+SKIP_PATHS = {
+    "node_modules", ".git", "__pycache__", ".venv", "venv",
+    "dist", "build", ".next", "target", "coverage",
+    "vendor", ".gradle", ".mvn", "bower_components",
+}
+
+MAX_FILE_SIZE_BYTES = 100_000
+MAX_FILES = 300
 
 
 @dataclass
@@ -32,10 +48,25 @@ class GitHubRepoInfo:
     size_kb: int
 
 
+@dataclass
+class GitHubFile:
+    path: str
+    content: str
+    size: int
+    language: str = ""
+
+
+_EXT_TO_LANG: dict[str, str] = {
+    ".py": "Python", ".js": "JavaScript", ".ts": "TypeScript",
+    ".tsx": "TypeScript", ".jsx": "JavaScript", ".java": "Java",
+    ".go": "Go", ".rb": "Ruby", ".rs": "Rust", ".cs": "C#",
+}
+
+
 class GitHubClient:
     """
-    Thin async wrapper around the GitHub REST API v3.
-    Injects PAT if available for higher rate limits (5000 req/hr vs 60).
+    Async GitHub API client — fetches file trees and contents directly.
+    No git clone required. Typically 5-10x faster than cloning.
     """
 
     def __init__(self):
@@ -47,10 +78,11 @@ class GitHubClient:
             self._headers["Authorization"] = f"Bearer {settings.github_token}"
 
     async def get_repo_info(self, owner: str, repo: str) -> GitHubRepoInfo:
-        """Fetch metadata for a repository from the GitHub API."""
+        """Fetch metadata for a repository, following redirects automatically."""
         url = f"{GITHUB_API_BASE}/repos/{owner}/{repo}"
-
-        async with httpx.AsyncClient(headers=self._headers, timeout=15.0) as client:
+        async with httpx.AsyncClient(
+            headers=self._headers, timeout=15.0, follow_redirects=True
+        ) as client:
             response = await client.get(url)
 
         if response.status_code == 404:
@@ -60,7 +92,7 @@ class GitHubClient:
         if response.status_code == 403:
             raise ExternalServiceError(
                 "GitHub",
-                "Rate limit exceeded. Add a GITHUB_TOKEN to .env to increase limit.",
+                "Rate limit exceeded. Add GITHUB_TOKEN to .env for 5000 req/hr.",
             )
         if response.status_code != 200:
             raise ExternalServiceError(
@@ -82,70 +114,164 @@ class GitHubClient:
         )
 
     async def get_languages(self, languages_url: str) -> list[str]:
-        """
-        Fetch languages used in a repo, sorted by bytes of code.
-        Returns names only (e.g. ['Python', 'TypeScript']).
-        """
-        async with httpx.AsyncClient(headers=self._headers, timeout=10.0) as client:
+        """Fetch languages sorted by bytes of code."""
+        async with httpx.AsyncClient(
+            headers=self._headers, timeout=10.0, follow_redirects=True
+        ) as client:
             response = await client.get(languages_url)
-
         if response.status_code != 200:
             logger.warning("Failed to fetch languages", status=response.status_code)
             return []
-
-        # GitHub returns {language: bytes}, sort by bytes descending
         data = response.json()
         return [lang for lang, _ in sorted(data.items(), key=lambda x: x[1], reverse=True)]
 
+    async def get_file_tree(self, owner: str, repo: str, branch: str) -> list[dict]:
+        """
+        Get the full recursive file tree using the Git Trees API.
+        Single API call — much faster than cloning.
+        """
+        url = f"{GITHUB_API_BASE}/repos/{owner}/{repo}/git/trees/{branch}?recursive=1"
+        async with httpx.AsyncClient(
+            headers=self._headers, timeout=30.0, follow_redirects=True
+        ) as client:
+            response = await client.get(url)
+
+        if response.status_code == 409:
+            return []   # empty repo
+        if response.status_code == 404:
+            return []   # branch not found — caller will try fallback
+        if response.status_code != 200:
+            raise ExternalServiceError(
+                "GitHub", f"Failed to get file tree: {response.status_code}"
+            )
+
+        data = response.json()
+        if data.get("truncated"):
+            logger.warning("File tree truncated (repo > 100k files)")
+
+        return [item for item in data.get("tree", []) if item.get("type") == "blob"]
+
+    async def fetch_files(
+        self,
+        owner: str,
+        repo: str,
+        file_tree: list[dict],
+        progress_callback: Optional[Callable[[int, int], None]] = None,
+    ) -> list["GitHubFile"]:
+        """
+        Download analyzable file contents concurrently (10 at a time).
+        No git clone — fetches only files we need via the Blobs API.
+        """
+        # Filter to analyzable files only
+        analyzable = []
+        for item in file_tree:
+            path = item.get("path", "")
+            size = item.get("size", 0)
+
+            parts = path.split("/")
+            if any(part in SKIP_PATHS for part in parts):
+                continue
+
+            ext = "." + path.rsplit(".", 1)[-1].lower() if "." in path else ""
+            if ext not in ANALYZABLE_EXTENSIONS:
+                continue
+
+            if size > MAX_FILE_SIZE_BYTES:
+                continue
+
+            analyzable.append(item)
+            if len(analyzable) >= MAX_FILES:
+                break
+
+        logger.info("Fetching files", total=len(analyzable), repo=f"{owner}/{repo}")
+
+        semaphore = asyncio.Semaphore(10)
+
+        async def fetch_one(item: dict, idx: int) -> Optional[GitHubFile]:
+            async with semaphore:
+                path = item["path"]
+                sha = item["sha"]
+                try:
+                    content = await self._fetch_blob(owner, repo, sha)
+                    if content is not None:
+                        ext = "." + path.rsplit(".", 1)[-1].lower() if "." in path else ""
+                        lang = _EXT_TO_LANG.get(ext, "Unknown")
+                        if progress_callback:
+                            progress_callback(idx + 1, len(analyzable))
+                        return GitHubFile(
+                            path=path,
+                            content=content,
+                            size=item.get("size", 0),
+                            language=lang,
+                        )
+                except Exception as e:
+                    logger.warning("Failed to fetch file", path=path, error=str(e))
+                return None
+
+        tasks = [fetch_one(item, i) for i, item in enumerate(analyzable)]
+        results = await asyncio.gather(*tasks)
+        files = [f for f in results if f is not None]
+        logger.info("Files fetched", count=len(files))
+        return files
+
+    async def _fetch_blob(self, owner: str, repo: str, sha: str) -> Optional[str]:
+        """Fetch and decode a single file blob by SHA."""
+        url = f"{GITHUB_API_BASE}/repos/{owner}/{repo}/git/blobs/{sha}"
+        async with httpx.AsyncClient(
+            headers=self._headers, timeout=15.0, follow_redirects=True
+        ) as client:
+            response = await client.get(url)
+
+        if response.status_code != 200:
+            return None
+
+        data = response.json()
+        if data.get("encoding") == "base64":
+            try:
+                return base64.b64decode(data["content"]).decode("utf-8", errors="replace")
+            except Exception:
+                return None
+        return data.get("content", "")
+
     async def check_rate_limit(self) -> dict:
-        """Returns current API rate limit status. Useful for debugging."""
-        async with httpx.AsyncClient(headers=self._headers, timeout=10.0) as client:
+        """Returns current GitHub API rate limit info."""
+        async with httpx.AsyncClient(
+            headers=self._headers, timeout=10.0, follow_redirects=True
+        ) as client:
             response = await client.get(f"{GITHUB_API_BASE}/rate_limit")
         if response.status_code == 200:
-            return response.json().get("rate", {})
+            core = response.json().get("rate", {})
+            logger.info(
+                "GitHub rate limit",
+                remaining=core.get("remaining"),
+                limit=core.get("limit"),
+            )
+            return core
         return {}
 
     @staticmethod
     def parse_github_url(url: str) -> tuple[str, str]:
-        """
-        Extract owner and repo name from any GitHub URL format.
-
-        Handles:
-          https://github.com/owner/repo
-          https://github.com/owner/repo.git
-          https://github.com/owner/repo/
-          github.com/owner/repo
-        """
+        """Parse owner and repo from any GitHub URL format."""
         url = url.strip().rstrip("/").removesuffix(".git")
-
-        # Validate it's actually a GitHub URL
         normalized = url.lower()
-        if "github.com" not in normalized or (
-            "github.com" in normalized and
-            not any(normalized.startswith(p) for p in (
-                "https://github.com", "http://github.com",
-                "github.com", "git@github.com"
-            ))
-        ):
+
+        if not any(normalized.startswith(p) for p in (
+            "https://github.com", "http://github.com",
+            "github.com", "git@github.com",
+        )):
             raise ValueError(
                 f"Not a GitHub URL: '{url}'. "
                 "Expected format: https://github.com/owner/repository"
             )
 
-        # Normalise: strip protocol prefix
         for prefix in ("https://", "http://", "git@github.com:"):
             if url.startswith(prefix):
                 url = url[len(prefix):]
                 break
 
-        # Now url should be: github.com/owner/repo  or  owner/repo
-        parts = url.replace("github.com/", "").split("/")
-        parts = [p for p in parts if p]  # remove empty strings
-
+        parts = [p for p in url.replace("github.com/", "").split("/") if p]
         if len(parts) < 2:
             raise ValueError(
-                f"Cannot parse GitHub URL '{url}'. "
-                "Expected format: https://github.com/owner/repository"
+                "Cannot parse GitHub URL. Expected: https://github.com/owner/repo"
             )
-
         return parts[0], parts[1]

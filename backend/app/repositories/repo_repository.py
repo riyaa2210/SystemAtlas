@@ -119,3 +119,12 @@ class RepoRepository:
             .limit(1)
         )
         return result.scalar_one_or_none()
+
+    async def get_all_snapshots(self, repo_id: uuid.UUID) -> list[AnalyticsSnapshot]:
+        """Returns all scan snapshots for a repo — used for scan history."""
+        result = await self.db.execute(
+            select(AnalyticsSnapshot)
+            .where(AnalyticsSnapshot.repository_id == repo_id)
+            .order_by(desc(AnalyticsSnapshot.created_at))
+        )
+        return list(result.scalars().all())

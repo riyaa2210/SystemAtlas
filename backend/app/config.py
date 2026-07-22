@@ -19,15 +19,15 @@ class Settings(BaseSettings):
     app_version: str = "1.0.0"
 
     # PostgreSQL
-    database_url: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/lam_db"
+    database_url: str = "postgresql+asyncpg://postgres:Riya2211Rps@db.vgwenhmvnjtfhkyuskib.supabase.co:5432/postgres"
 
     # Neo4j
     neo4j_uri: str = "bolt://localhost:7687"
     neo4j_username: str = "neo4j"
-    neo4j_password: str = "password"
+    neo4j_password: str = "Riya@222005"
 
     # JWT — default only safe for dev; always override in production
-    secret_key: str = "dev-secret-key-change-this-in-production-32chars"
+    secret_key: str = "3ce8f78a3bc9a55ef35c52d8614df5bd9d84b3b3e1c76fd7b2b2e6af3e7ab419"
     algorithm: str = "HS256"
     access_token_expire_minutes: int = 1440  # 24 hours
 
