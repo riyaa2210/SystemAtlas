@@ -1,34 +1,34 @@
-# Web Framework
+# ── Web Framework ────────────────────────────────────────────────────────────
 fastapi==0.111.0
 uvicorn[standard]==0.29.0
 
-# Database - PostgreSQL
+# ── Database — PostgreSQL ─────────────────────────────────────────────────────
 sqlalchemy==2.0.30
 asyncpg==0.29.0
 alembic==1.13.1
 psycopg2-binary==2.9.9
 
-# Database - Neo4j
+# ── Database — Neo4j ─────────────────────────────────────────────────────────
 neo4j==5.20.0
 
-# Auth & Security
+# ── Auth & Security ───────────────────────────────────────────────────────────
 python-jose[cryptography]==3.3.0
 passlib[bcrypt]==1.7.4
 bcrypt==4.0.1
 python-multipart==0.0.9
 
-# Config & Validation — use versions with pre-built wheels for Python 3.11
+# ── Config & Validation (pre-built wheels for Python 3.11) ───────────────────
 pydantic==2.9.2
 pydantic-settings==2.5.2
 python-dotenv==1.0.1
 
-# HTTP Client
+# ── HTTP Client ───────────────────────────────────────────────────────────────
 httpx==0.27.0
 
-# AI
+# ── AI ────────────────────────────────────────────────────────────────────────
 google-generativeai==0.7.2
 
-# Utilities
+# ── Utilities ─────────────────────────────────────────────────────────────────
 aiofiles==23.2.1
 tenacity==8.3.0
 structlog==24.1.0

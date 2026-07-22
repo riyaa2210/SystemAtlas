@@ -1,7 +1,9 @@
 import type { NextConfig } from "next";
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000/api/v1";
-// Extract base URL (without /api/v1) for the proxy destination
+const API_URL =
+  process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000/api/v1";
+
+// Strip /api/v1 suffix to get the base URL for the proxy
 const API_BASE = API_URL.replace(/\/api\/v1\/?$/, "");
 
 const nextConfig: NextConfig = {
@@ -11,7 +13,7 @@ const nextConfig: NextConfig = {
   typescript: { ignoreBuildErrors: true },
   eslint: { ignoreDuringBuilds: true },
 
-  // Proxy /api/v1/* → backend so there are zero CORS issues in dev
+  // Proxy /api/v1/* → backend so CORS is never an issue
   async rewrites() {
     return [
       {
