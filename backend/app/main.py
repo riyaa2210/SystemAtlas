@@ -1,51 +1,60 @@
-"""
-FastAPI application entry point.
-"""
+"""FastAPI application entry point."""
 import os
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.config import get_settings
-from app.api.v1.router import api_router
-from app.db.postgres import create_db_tables
-from app.utils.logger import get_logger
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("lam")
 
-logger = get_logger(__name__)
-settings = get_settings()
+
+def _get_settings():
+    try:
+        from app.config import get_settings
+        return get_settings()
+    except Exception as e:
+        log.error(f"Failed to load settings: {e}")
+        raise
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup and shutdown logic."""
-    logger.info("Starting Living Architecture Map API", version=settings.app_version)
-
-    os.makedirs(settings.temp_dir, exist_ok=True)
+    log.info("LAM API starting up...")
+    settings = _get_settings()
 
     try:
-        await create_db_tables()
-        logger.info("Database tables ready")
+        os.makedirs(settings.temp_dir, exist_ok=True)
     except Exception as e:
-        logger.warning("Database not available at startup", error=str(e))
+        log.warning(f"Could not create temp dir: {e}")
 
-    logger.info("Application startup complete")
+    # DB tables — non-fatal, server starts even if DB is unreachable
+    try:
+        from app.db.postgres import create_db_tables
+        await create_db_tables()
+        log.info("Database tables ready")
+    except Exception as e:
+        log.warning(f"DB startup warning (non-fatal): {e}")
+
+    log.info("LAM API startup complete")
     yield
-    logger.info("Application shutting down")
+    log.info("LAM API shutting down")
 
 
 def create_app() -> FastAPI:
+    settings = _get_settings()
+
     app = FastAPI(
-        title=settings.app_name,
-        version=settings.app_version,
+        title="Living Architecture Map",
+        version="1.0.0",
         description="AI-powered software architecture visualization platform.",
         docs_url="/docs",
         redoc_url="/redoc",
         lifespan=lifespan,
     )
 
-    # ── CORS — must be added FIRST, before any other middleware or routes ──────
-    # allow_credentials=True requires explicit origins (not "*")
+    # CORS — must be first middleware
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_origins_list,
@@ -55,12 +64,13 @@ def create_app() -> FastAPI:
         expose_headers=["*"],
     )
 
-    # ── Routes ─────────────────────────────────────────────────────────────────
+    # Routes
+    from app.api.v1.router import api_router
     app.include_router(api_router, prefix="/api/v1")
 
-    @app.get("/health", tags=["Health"])
-    async def health_check():
-        return {"status": "ok", "version": settings.app_version}
+    @app.get("/health")
+    async def health():
+        return {"status": "ok", "version": "1.0.0"}
 
     return app
 
