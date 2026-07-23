@@ -1,17 +1,17 @@
 /**
- * Axios instance with automatic JWT injection and 401 redirect.
+ * Axios instance.
  *
- * In development: calls go through Next.js rewrites → /api/v1/* → backend
- * (zero CORS issues because the request never leaves localhost).
- * In production: set NEXT_PUBLIC_API_URL to your deployed backend URL.
+ * Always uses relative URL /api/v1/* so requests go through
+ * the Next.js rewrite proxy → backend. This means the browser
+ * NEVER makes a cross-origin request — CORS is completely eliminated.
+ *
+ * next.config.ts rewrites /api/v1/* → NEXT_PUBLIC_API_URL/*
  */
 import axios from "axios";
 
-// Use the env var directly — Next.js rewrites handle proxying in dev
-const baseURL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000/api/v1";
-
 const apiClient = axios.create({
-  baseURL,
+  // Relative URL — works in both dev and production via Next.js rewrites
+  baseURL: "/api/v1",
   headers: { "Content-Type": "application/json" },
   withCredentials: false,
 });
