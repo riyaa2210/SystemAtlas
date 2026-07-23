@@ -26,6 +26,10 @@ def _get_model():
         if not settings.gemini_api_key:
             raise ExternalServiceError("Gemini", "GEMINI_API_KEY is not configured")
 
+        print("Gemini key:", settings.gemini_api_key)
+        print("Length:", len(settings.gemini_api_key) if settings.gemini_api_key else 0)
+        
+        print("Configuring Gemini...")
         genai.configure(api_key=settings.gemini_api_key)
         _model = genai.GenerativeModel(
             model_name="gemini-1.5-flash",
