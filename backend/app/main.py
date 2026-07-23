@@ -21,21 +21,16 @@ async def lifespan(app: FastAPI):
     """Startup and shutdown logic."""
     logger.info("Starting Living Architecture Map API", version=settings.app_version)
 
-    # Ensure temp directory exists
     os.makedirs(settings.temp_dir, exist_ok=True)
 
-    # Create PostgreSQL tables on every startup (idempotent — CREATE TABLE IF NOT EXISTS)
     try:
         await create_db_tables()
+        logger.info("Database tables ready")
     except Exception as e:
-        logger.warning(
-            "Database not available at startup",
-            error=str(e),
-        )
+        logger.warning("Database not available at startup", error=str(e))
 
     logger.info("Application startup complete")
     yield
-
     logger.info("Application shutting down")
 
 
@@ -43,25 +38,27 @@ def create_app() -> FastAPI:
     app = FastAPI(
         title=settings.app_name,
         version=settings.app_version,
-        description="AI-powered software architecture visualization and code intelligence platform.",
+        description="AI-powered software architecture visualization platform.",
         docs_url="/docs",
         redoc_url="/redoc",
         lifespan=lifespan,
     )
 
-    # CORS — accept all origins in production (tighten after confirming deployment works)
+    # ── CORS — must be added FIRST, before any other middleware or routes ──────
+    # allow_credentials=True requires explicit origins (not "*")
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=False,   # must be False when allow_origins=["*"]
+        allow_origins=settings.cors_origins_list,
+        allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
+        expose_headers=["*"],
     )
 
-    # Routes
+    # ── Routes ─────────────────────────────────────────────────────────────────
     app.include_router(api_router, prefix="/api/v1")
 
-    @app.get("/health")
+    @app.get("/health", tags=["Health"])
     async def health_check():
         return {"status": "ok", "version": settings.app_version}
 

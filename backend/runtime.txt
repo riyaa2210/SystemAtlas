@@ -1,5 +1,1 @@
-<<<<<<< HEAD
-python-3.11.11
-=======
 3.11.11
->>>>>>> d8a0dde (feat: full LAM - GitHub API scanner, PostgreSQL graph, UI redesign, deploy config)
