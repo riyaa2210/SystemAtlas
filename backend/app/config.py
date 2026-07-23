@@ -1,7 +1,6 @@
 """
 Application configuration using pydantic-settings.
-All values are read from environment variables / .env file.
-All fields have safe defaults so startup never crashes from missing vars.
+All fields have production-safe defaults so Render works without env vars.
 """
 from functools import lru_cache
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -15,31 +14,33 @@ class Settings(BaseSettings):
     )
 
     # App
-    app_env: str = "development"
+    app_env: str = "production"
     app_name: str = "Living Architecture Map"
     app_version: str = "1.0.0"
 
-    # PostgreSQL — default is local dev; set DATABASE_URL env var in production
-    database_url: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/lam_db"
+    # PostgreSQL — Supabase Session Pooler (port 5432, statement_cache_size=0)
+    database_url: str = (
+        "postgresql+asyncpg://postgres.vgwenhmvnjtfhkyuskib:Riya2211Rps"
+        "@aws-0-ap-northeast-1.pooler.supabase.com:5432/postgres"
+    )
 
-    # Neo4j — optional; graph features degrade gracefully if unavailable
+    # Neo4j — optional, graph features skip gracefully if unavailable
     neo4j_uri: str = "bolt://localhost:7687"
     neo4j_username: str = "neo4j"
     neo4j_password: str = "password"
 
     # JWT
-    secret_key: str = "dev-secret-key-change-in-production-minimum-32-chars"
+    secret_key: str = "3ce8f78a3bc9a55ef35c52d8614df5bd9d84b3b3e1c76fd7b2b2e6af3e7ab419"
     algorithm: str = "HS256"
     access_token_expire_minutes: int = 1440
 
-    # AI — optional; copilot disabled if empty
+    # AI — Gemini API key
     gemini_api_key: str = ""
 
-    # GitHub — optional; lower rate limit without token
+    # GitHub
     github_token: str = ""
 
-    # CORS — comma-separated list of allowed origins
-    # Production: set CORS_ORIGINS env var in Render to include your Vercel URL
+    # CORS — includes all deployment URLs
     cors_origins: str = (
         "http://localhost:3000,"
         "http://localhost:3001,"
@@ -53,7 +54,7 @@ class Settings(BaseSettings):
 
     @property
     def cors_origins_list(self) -> list[str]:
-        return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]
+        return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
 
     @property
     def is_development(self) -> bool:
@@ -62,5 +63,4 @@ class Settings(BaseSettings):
 
 @lru_cache
 def get_settings() -> Settings:
-    """Cached settings — loaded once at startup."""
     return Settings()
