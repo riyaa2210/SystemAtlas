@@ -1,0 +1,134 @@
+@import "tailwindcss";
+
+/* ── Design tokens ────────────────────────────────────────────────────────── */
+:root {
+  --radius: 0.625rem;
+}
+
+.dark {
+  /* Base surfaces */
+  --background:         224 20% 6%;      /* #0d0f17 deep space */
+  --foreground:         213 31% 91%;     /* #dce4f0 cool white */
+
+  /* Cards + popovers */
+  --card:               224 20% 9%;      /* #111420 slightly lighter */
+  --card-foreground:    213 31% 91%;
+
+  --popover:            224 20% 9%;
+  --popover-foreground: 213 31% 91%;
+
+  /* Brand — indigo-violet */
+  --primary:            245 75% 64%;     /* #6d5ef8 vivid indigo */
+  --primary-foreground: 0 0% 100%;
+
+  /* Secondary surfaces */
+  --secondary:          224 18% 14%;     /* #1a1d2e subtle layer */
+  --secondary-foreground: 213 31% 91%;
+
+  /* Muted text / placeholders */
+  --muted:              224 18% 14%;
+  --muted-foreground:   220 14% 50%;     /* #6e778a medium grey */
+
+  /* Accent — purple pop */
+  --accent:             262 60% 22%;     /* #2d1d5e deep purple */
+  --accent-foreground:  245 75% 80%;     /* light indigo */
+
+  /* Danger */
+  --destructive:        0 75% 42%;
+  --destructive-foreground: 0 0% 100%;
+
+  /* Borders + inputs */
+  --border:             224 18% 16%;     /* #1e2235 subtle border */
+  --input:              224 18% 16%;
+  --ring:               245 75% 64%;     /* match primary */
+}
+
+/* ── Base reset ───────────────────────────────────────────────────────────── */
+*, *::before, *::after {
+  border-color: hsl(var(--border));
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  background-color: hsl(var(--background));
+  color: hsl(var(--foreground));
+  font-feature-settings: "rlig" 1, "calt" 1;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* ── Scrollbar ────────────────────────────────────────────────────────────── */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: hsl(var(--border));
+  border-radius: 9999px;
+}
+::-webkit-scrollbar-thumb:hover { background: hsl(var(--muted-foreground) / 0.4); }
+
+/* ── Glassmorphism utility ────────────────────────────────────────────────── */
+.glass {
+  background: hsl(var(--card) / 0.7);
+  backdrop-filter: blur(12px) saturate(180%);
+  -webkit-backdrop-filter: blur(12px) saturate(180%);
+  border: 1px solid hsl(var(--border) / 0.8);
+}
+
+/* ── Gradient text ────────────────────────────────────────────────────────── */
+.gradient-text {
+  background: linear-gradient(135deg, #a78bfa 0%, #818cf8 50%, #38bdf8 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+/* ── Glow effects ─────────────────────────────────────────────────────────── */
+.glow-primary {
+  box-shadow: 0 0 20px hsl(245 75% 64% / 0.25), 0 0 60px hsl(245 75% 64% / 0.1);
+}
+
+.glow-sm {
+  box-shadow: 0 0 12px hsl(245 75% 64% / 0.2);
+}
+
+/* ── Animations ───────────────────────────────────────────────────────────── */
+@keyframes shimmer {
+  0%   { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+
+@keyframes fade-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes pulse-ring {
+  0%   { transform: scale(1);    opacity: 1; }
+  100% { transform: scale(1.5);  opacity: 0; }
+}
+
+.animate-fade-in   { animation: fade-in 0.3s ease forwards; }
+.animate-shimmer   { animation: shimmer 2s linear infinite; }
+
+/* Loading skeleton shimmer */
+.skeleton {
+  background: linear-gradient(
+    90deg,
+    hsl(var(--secondary)) 25%,
+    hsl(var(--muted)) 50%,
+    hsl(var(--secondary)) 75%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 1.5s ease-in-out infinite;
+}
+
+/* ── ReactFlow overrides ──────────────────────────────────────────────────── */
+.react-flow__background { background: hsl(var(--background)) !important; }
+.react-flow__controls { background: hsl(var(--card)) !important; border: 1px solid hsl(var(--border)) !important; border-radius: 8px !important; overflow: hidden; }
+.react-flow__controls-button { background: transparent !important; border: none !important; color: hsl(var(--muted-foreground)) !important; }
+.react-flow__controls-button:hover { background: hsl(var(--secondary)) !important; color: hsl(var(--foreground)) !important; }
+.react-flow__minimap { background: hsl(var(--card)) !important; border: 1px solid hsl(var(--border)) !important; border-radius: 8px !important; }
